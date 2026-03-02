@@ -31,6 +31,7 @@ import {
   Handshake,
   PartyPopper,
   CheckCircle2,
+  Layers,
 } from "lucide-react";
 
 // ==========================================
@@ -46,7 +47,7 @@ const firebaseConfig = {
 };
 
 const appId = "ma-brothers-shared-fund-app";
-const LEDGER_NAME = "ma_brothers_zerosum_v13"; // V13: 加入金額變動追蹤與回溯功能
+const LEDGER_NAME = "ma_brothers_zerosum_v13"; // 維持 v13，無縫升級
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
@@ -92,21 +93,25 @@ const App = () => {
   const [transferTo, setTransferTo] = useState("third");
   const [transferAmount, setTransferAmount] = useState("");
 
+  // 單筆日期 / 批量多月 狀態
+  const [isBatchMode, setIsBatchMode] = useState(false);
   const [expenseDate, setExpenseDate] = useState(
     new Date().toISOString().split("T")[0]
   );
   const [isMonthOnly, setIsMonthOnly] = useState(false);
 
+  const currentMonthStr = new Date().toISOString().slice(0, 7); // YYYY-MM
+  const [batchStartMonth, setBatchStartMonth] = useState(currentMonthStr);
+  const [batchEndMonth, setBatchEndMonth] = useState(currentMonthStr);
+
   const [editingPerson, setEditingPerson] = useState(null);
   const [editValue, setEditValue] = useState("");
 
-  // 刪除確認 Modal 狀態
+  // 刪除確認 & 結算 Modal 狀態
   const [deleteDialog, setDeleteDialog] = useState({
     isOpen: false,
     log: null,
   });
-
-  // 結算 Modal 狀態
   const [showSettleModal, setShowSettleModal] = useState(false);
 
   // --- 1. Firebase 驗證 ---
@@ -173,9 +178,10 @@ const App = () => {
     };
   }, [user]);
 
+  // 改寫 commitData 以支援同時寫入多筆 Logs (批量輸入用)
   const commitData = async (
     newBalances,
-    newLog = null,
+    newLogs = null,
     newQuickInputs = quickInputs
   ) => {
     if (!user) return;
@@ -195,18 +201,27 @@ const App = () => {
         { balances: newBalances, quickInputs: newQuickInputs },
         { merge: true }
       );
-      if (newLog) {
-        const logId = Date.now().toString();
-        const logRef = doc(
-          db,
-          "artifacts",
-          appId,
-          "public",
-          "data",
-          `${LEDGER_NAME}_logs`,
-          logId
-        );
-        await setDoc(logRef, { ...newLog, timestamp: Date.now(), id: logId });
+
+      if (newLogs) {
+        const logsArray = Array.isArray(newLogs) ? newLogs : [newLogs];
+        const promises = logsArray.map((log, index) => {
+          const logId = Date.now().toString() + "_" + index; // 加 index 避免 ID 衝突
+          const logRef = doc(
+            db,
+            "artifacts",
+            appId,
+            "public",
+            "data",
+            `${LEDGER_NAME}_logs`,
+            logId
+          );
+          return setDoc(logRef, {
+            ...log,
+            timestamp: Date.now() + index,
+            id: logId,
+          });
+        });
+        await Promise.all(promises);
       }
       setSyncStatus("synced");
     } catch (e) {
@@ -216,7 +231,8 @@ const App = () => {
 
   const getDisplayDate = (dateStr, monthOnly) => {
     if (!dateStr) return "";
-    if (monthOnly) {
+    // 如果傳入的是 YYYY-MM 格式，強制當作 monthOnly 處理
+    if (dateStr.length === 7 || monthOnly) {
       const [year, month] = dateStr.split("-");
       return `${year}年${month}月`;
     }
@@ -238,9 +254,6 @@ const App = () => {
     commitData(balances, null, nextQuickInputs);
   };
 
-  // ==========================================
-  // 💡 V13 新增：精準計算金額變動 (Balance Changes)
-  // ==========================================
   const calculateChanges = (oldBals, newBals) => {
     return {
       big: newBals.big - oldBals.big,
@@ -249,7 +262,24 @@ const App = () => {
     };
   };
 
-  // --- 核心邏輯 1：記支出 ---
+  // 取得起訖月份之間的所有月份字串 (YYYY-MM)
+  const getMonthsInRange = (startStr, endStr) => {
+    const dates = [];
+    let [sYear, sMonth] = startStr.split("-").map(Number);
+    const [eYear, eMonth] = endStr.split("-").map(Number);
+
+    while (sYear < eYear || (sYear === eYear && sMonth <= eMonth)) {
+      dates.push(`${sYear}-${String(sMonth).padStart(2, "0")}`);
+      sMonth++;
+      if (sMonth > 12) {
+        sMonth = 1;
+        sYear++;
+      }
+    }
+    return dates;
+  };
+
+  // --- 核心邏輯 1：記支出 (支援批量) ---
   const handleAddExpense = (e) => {
     e.preventDefault();
     const amt = Number(formAmount);
@@ -263,26 +293,65 @@ const App = () => {
       return;
     }
 
-    const dateLabel = getDisplayDate(expenseDate, isMonthOnly);
-    const prevBalances = { ...balances };
-    const nextBalances = { ...balances };
-
-    nextBalances[formPayer] += amt;
-
-    let totalDeducted = 0;
-    activeSharers.forEach((id, index) => {
-      let shareAmt = Math.round(amt / activeSharers.length);
-      if (index === activeSharers.length - 1) {
-        shareAmt = amt - totalDeducted;
+    let monthsToProcess = [];
+    if (isBatchMode) {
+      if (
+        !batchStartMonth ||
+        !batchEndMonth ||
+        batchStartMonth > batchEndMonth
+      ) {
+        alert("開始月份不能晚於結束月份！請重新選擇。");
+        return;
       }
-      nextBalances[id] -= shareAmt;
-      totalDeducted += shareAmt;
-    });
+      monthsToProcess = getMonthsInRange(batchStartMonth, batchEndMonth);
+    } else {
+      monthsToProcess = [expenseDate]; // 單筆模式，陣列只裝一天
+    }
 
-    const sharerNames = activeSharers
-      .map((id) => BROTHERS[id].name.split(" ")[1])
-      .join("、");
-    const balanceChanges = calculateChanges(prevBalances, nextBalances);
+    const nextBalances = JSON.parse(JSON.stringify(balances));
+    const logsToCreate = [];
+
+    // 針對每一個月份/日期，循序計算餘額並產生 Log
+    monthsToProcess.forEach((dateStr) => {
+      const prevBalances = { ...nextBalances }; // 紀錄計算此筆「之前」的狀態
+
+      // 1. 付錢的人：餘額 [+]
+      nextBalances[formPayer] += amt;
+
+      // 2. 分擔的人：餘額 [-]
+      let totalDeducted = 0;
+      activeSharers.forEach((id, index) => {
+        let shareAmt = Math.round(amt / activeSharers.length);
+        if (index === activeSharers.length - 1) {
+          shareAmt = amt - totalDeducted;
+        }
+        nextBalances[id] -= shareAmt;
+        totalDeducted += shareAmt;
+      });
+
+      const sharerNames = activeSharers
+        .map((id) => BROTHERS[id].name.split(" ")[1])
+        .join("、");
+      const balanceChanges = calculateChanges(prevBalances, nextBalances);
+
+      // 如果是批量模式，日期直接顯示該月份，並在項目後方加上月份標籤
+      const displayDate = isBatchMode
+        ? getDisplayDate(dateStr, true)
+        : getDisplayDate(dateStr, isMonthOnly);
+      const finalDesc = isBatchMode ? `${formName} (${displayDate})` : formName;
+
+      logsToCreate.push({
+        date: displayDate,
+        type: "expense",
+        desc: finalDesc,
+        amount: amt,
+        details: `${
+          BROTHERS[formPayer].name.split(" ")[1]
+        } 支付。由 ${sharerNames} 分擔。`,
+        previousBalances: prevBalances,
+        balanceChanges: balanceChanges,
+      });
+    });
 
     let nextQuickInputs = [...quickInputs];
     if (saveAsQuick) {
@@ -292,22 +361,9 @@ const App = () => {
         nextQuickInputs.push({ id: Date.now(), name: formName, amount: amt });
     }
 
-    commitData(
-      nextBalances,
-      {
-        date: dateLabel,
-        type: "expense",
-        desc: formName,
-        amount: amt,
-        details: `${
-          BROTHERS[formPayer].name.split(" ")[1]
-        } 支付。由 ${sharerNames} 分擔。`,
-        previousBalances: prevBalances, // 存下上一步的狀態，方便直接 Undo
-        balanceChanges: balanceChanges, // 存下差額，方便單獨抽除這筆紀錄
-      },
-      nextQuickInputs
-    );
+    commitData(nextBalances, logsToCreate, nextQuickInputs);
 
+    // 重置表單
     setFormName("");
     setFormAmount("");
     setSaveAsQuick(false);
@@ -361,20 +417,16 @@ const App = () => {
     setEditingPerson(null);
   };
 
-  // ==========================================
-  // 💡 V14 新增：自動計算結算計畫與歸零
-  // ==========================================
+  // --- 結算演算法 ---
   const calculateSettlement = () => {
     let debtors = [];
     let creditors = [];
 
-    // 負數(欠錢)放入 debtors，正數(應收)放入 creditors
     Object.entries(balances).forEach(([id, bal]) => {
       if (bal < 0) debtors.push({ id, amount: Math.abs(bal) });
       else if (bal > 0) creditors.push({ id, amount: bal });
     });
 
-    // 排序以盡量減少交易筆數
     debtors.sort((a, b) => b.amount - a.amount);
     creditors.sort((a, b) => b.amount - a.amount);
 
@@ -382,7 +434,6 @@ const App = () => {
     let i = 0,
       j = 0;
 
-    // 配對演算法：欠錢的人依序還給應收錢的人
     while (i < debtors.length && j < creditors.length) {
       let debtor = debtors[i];
       let creditor = creditors[j];
@@ -422,11 +473,7 @@ const App = () => {
     setShowSettleModal(false);
   };
 
-  // ==========================================
-  // 💡 V13 新增功能：復原與回溯
-  // ==========================================
-
-  // 復原最新一筆 (Undo)
+  // --- 復原與刪除 ---
   const handleUndoLast = async () => {
     if (logs.length === 0) return;
     const latestLog = logs[0];
@@ -443,7 +490,6 @@ const App = () => {
     ) {
       setSyncStatus("connecting");
       try {
-        // 恢復到紀錄當下的前一個狀態
         const stateRef = doc(
           db,
           "artifacts",
@@ -459,7 +505,6 @@ const App = () => {
           { merge: true }
         );
 
-        // 刪除該筆紀錄
         await deleteDoc(
           doc(
             db,
@@ -478,7 +523,6 @@ const App = () => {
     }
   };
 
-  // 確認進階刪除 (僅刪除 or 回溯金額)
   const handleConfirmDelete = async (shouldRollback) => {
     const log = deleteDialog.log;
     if (!log) return;
@@ -486,8 +530,6 @@ const App = () => {
     setSyncStatus("connecting");
     try {
       if (shouldRollback && log.balanceChanges) {
-        // 如果選擇回溯，我們把這筆當時造成的「變動」反向扣回去
-        // 例如當時大哥是 +3000，我們現在就把目前的大哥扣掉 3000
         const nextBalances = { ...balances };
         Object.keys(log.balanceChanges).forEach((person) => {
           nextBalances[person] -= log.balanceChanges[person];
@@ -539,7 +581,7 @@ const App = () => {
               兄弟記帳清算
             </h1>
             <p className="text-[10px] text-slate-400 font-bold mt-1 tracking-widest uppercase">
-              零和回溯版 v13
+              零和算法 v13 Batch
             </p>
           </div>
         </div>
@@ -684,9 +726,10 @@ const App = () => {
             {/* TAB: 記支出 */}
             {activeTab === "expense" && (
               <form onSubmit={handleAddExpense} className="space-y-6">
+                {/* 快速項目 */}
                 <div className="space-y-2">
                   <label className="text-[10px] font-black text-slate-400 ml-1 flex items-center gap-1">
-                    <BookmarkPlus className="w-3 h-3" /> 快速帶入：
+                    <BookmarkPlus className="w-3 h-3" /> 點擊快速帶入：
                   </label>
                   <div className="flex flex-wrap gap-2">
                     {quickInputs.map((q) => (
@@ -716,32 +759,95 @@ const App = () => {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 bg-slate-50 p-4 rounded-2xl border border-slate-200/50 shadow-inner">
-                  <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] font-black text-slate-400 uppercase flex items-center gap-1.5 ml-1">
-                      <Calendar className="w-3 h-3" /> 支出時間
+                {/* 輸入模式切換與日期選擇 */}
+                <div className="bg-slate-50 p-4 rounded-2xl border border-slate-200/50 shadow-inner space-y-4">
+                  <div className="flex justify-between items-center border-b border-slate-200 pb-3">
+                    <label className="text-[10px] font-black text-slate-500 uppercase flex items-center gap-1.5 ml-1">
+                      <Calendar className="w-3 h-3" /> 支出時間設定
                     </label>
-                    <input
-                      type={isMonthOnly ? "month" : "date"}
-                      value={expenseDate}
-                      onChange={(e) => setExpenseDate(e.target.value)}
-                      className="p-3 border rounded-xl font-black text-xs bg-white outline-none focus:ring-2 focus:ring-blue-500 shadow-sm"
-                    />
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setIsBatchMode(false)}
+                        className={`text-[10px] font-black px-3 py-1.5 rounded-lg transition-all ${
+                          !isBatchMode
+                            ? "bg-blue-600 text-white shadow-sm"
+                            : "bg-slate-200 text-slate-500"
+                        }`}
+                      >
+                        單筆輸入
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setIsBatchMode(true)}
+                        className={`text-[10px] font-black px-3 py-1.5 rounded-lg transition-all flex items-center gap-1 ${
+                          isBatchMode
+                            ? "bg-indigo-600 text-white shadow-sm"
+                            : "bg-slate-200 text-slate-500"
+                        }`}
+                      >
+                        <Layers className="w-3 h-3" /> 批量多月
+                      </button>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2 mt-auto pb-1 ml-1">
-                    <label className="relative inline-flex items-center cursor-pointer group">
-                      <input
-                        type="checkbox"
-                        checked={isMonthOnly}
-                        onChange={(e) => setIsMonthOnly(e.target.checked)}
-                        className="sr-only peer"
-                      />
-                      <div className="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-blue-600"></div>
-                      <span className="ml-3 text-[10px] font-black text-slate-500 group-hover:text-blue-600">
-                        只選月份
-                      </span>
-                    </label>
-                  </div>
+
+                  {isBatchMode ? (
+                    // 批量多月模式
+                    <div className="flex items-center gap-3 animate-in fade-in slide-in-from-top-2">
+                      <div className="flex-1 space-y-1.5">
+                        <label className="text-[10px] font-black text-slate-400">
+                          開始月份
+                        </label>
+                        <input
+                          type="month"
+                          value={batchStartMonth}
+                          onChange={(e) => setBatchStartMonth(e.target.value)}
+                          className="w-full p-3 border rounded-xl font-black text-xs bg-white outline-none focus:ring-2 focus:ring-indigo-500 shadow-sm"
+                        />
+                      </div>
+                      <div className="text-slate-400 font-black mt-5">至</div>
+                      <div className="flex-1 space-y-1.5">
+                        <label className="text-[10px] font-black text-slate-400">
+                          結束月份
+                        </label>
+                        <input
+                          type="month"
+                          value={batchEndMonth}
+                          onChange={(e) => setBatchEndMonth(e.target.value)}
+                          className="w-full p-3 border rounded-xl font-black text-xs bg-white outline-none focus:ring-2 focus:ring-indigo-500 shadow-sm"
+                        />
+                      </div>
+                    </div>
+                  ) : (
+                    // 單筆輸入模式
+                    <div className="flex items-end gap-3 animate-in fade-in">
+                      <div className="flex-1 space-y-1.5">
+                        <label className="text-[10px] font-black text-slate-400">
+                          日期
+                        </label>
+                        <input
+                          type={isMonthOnly ? "month" : "date"}
+                          value={expenseDate}
+                          onChange={(e) => setExpenseDate(e.target.value)}
+                          className="w-full p-3 border rounded-xl font-black text-xs bg-white outline-none focus:ring-2 focus:ring-blue-500 shadow-sm"
+                        />
+                      </div>
+                      <div className="flex items-center gap-2 pb-3 pl-2">
+                        <label className="relative inline-flex items-center cursor-pointer group">
+                          <input
+                            type="checkbox"
+                            checked={isMonthOnly}
+                            onChange={(e) => setIsMonthOnly(e.target.checked)}
+                            className="sr-only peer"
+                          />
+                          <div className="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-blue-600"></div>
+                          <span className="ml-3 text-[10px] font-black text-slate-500 group-hover:text-blue-600">
+                            只選月份
+                          </span>
+                        </label>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 <div className="space-y-4">
@@ -761,7 +867,7 @@ const App = () => {
                     </div>
                     <div className="space-y-1.5">
                       <label className="text-[10px] font-black text-slate-400 ml-1">
-                        總金額
+                        {isBatchMode ? "每月產生金額" : "總金額"}
                       </label>
                       <div className="relative">
                         <span className="absolute left-4 top-4 text-slate-300 font-black text-sm">
@@ -879,12 +985,12 @@ const App = () => {
                   disabled={syncStatus !== "synced"}
                   className="w-full py-5 bg-blue-600 hover:bg-blue-700 text-white rounded-[2rem] font-black shadow-xl shadow-blue-200 transition-all active:scale-[0.98] text-base"
                 >
-                  確認寫入支出
+                  {isBatchMode ? "確認批次寫入多筆紀錄" : "確認寫入支出"}
                 </button>
               </form>
             )}
 
-            {/* TAB: 轉帳 */}
+            {/* TAB: 給現金 / 轉帳 */}
             {activeTab === "transfer" && (
               <form onSubmit={handleTransfer} className="space-y-6">
                 <div className="bg-emerald-50 p-5 border border-emerald-200 rounded-3xl text-emerald-800 text-[11px] leading-relaxed flex gap-4 shadow-sm font-bold">
@@ -1057,7 +1163,7 @@ const App = () => {
                             }
                             className="text-[9px] text-rose-400 hover:text-rose-600 font-black px-2 py-1 rounded-md hover:bg-rose-50 transition-all opacity-0 group-hover:opacity-100 border border-transparent hover:border-rose-200 flex items-center gap-1"
                           >
-                            <Trash2 className="w-3 h-3" /> 刪除設定
+                            <Trash2 className="w-3 h-3" /> 刪除
                           </button>
                         </div>
                       </div>
@@ -1070,7 +1176,7 @@ const App = () => {
         </section>
 
         <p className="text-center text-[10px] text-slate-300 font-black uppercase tracking-[0.35em] py-16">
-          Ma Brothers System • V13 Undo Feature
+          Ma Brothers System • V13 Zero-Sum
         </p>
       </main>
 
